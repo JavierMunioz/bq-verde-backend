@@ -1,26 +1,49 @@
 # main.py — TUS MODELOS ESTÁN BIEN. SOLO CORRIGIENDO ENDPOINTS.
-
-from fastapi import FastAPI, HTTPException, status, Depends
+from scripts.create_img import save_base64_image
+from fastapi import FastAPI, HTTPException, status, Depends, Request
+from fastapi.responses import JSONResponse
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from datetime import datetime, timedelta
 from typing import List, Optional
 import os
+from uvicorn.config import Config
+from uvicorn.server import Server
+from pathlib import Path
 from models.models import *  # Tus modelos están bien
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 # === NUEVO: IMPORT MOTOR (¡ESTO ES LO ÚNICO QUE AÑADES!) ===
 from motor.motor_asyncio import AsyncIOMotorClient
-
 # Cargar variables de entorno
 load_dotenv()
-
 app = FastAPI(title="Sistema de News & Documents")
 
+
+class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024):  # 50 MB
+        super().__init__(app)
+        self.max_upload_size = max_upload_size
+
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > self.max_upload_size:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "File too large (max 50 MB)"},
+            )
+        return await call_next(request)
+
+app.add_middleware(LimitUploadSizeMiddleware, max_upload_size=50 * 1024 * 1024)
+
+
+os.makedirs("uploads/news", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # Configurar CORS
 app.add_middleware(
     CORSMiddleware,
@@ -109,16 +132,56 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 # === NEWS ===
 
+
 @app.post("/news", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
 async def create_news(
     news: NewsCreate,
     current_user: dict = Depends(get_current_user)
 ):
     news_dict = news.dict()
-    news_dict["created_at"] = news_dict["updated_at"] = datetime.utcnow()
+
+    # Si viene imagen en base64 (en img_url), guardarla
+    image_url = None
+    if news_dict.get("img_url"):  # ← ¡Aquí! Usar el nombre correcto
+        try:
+            image_url = save_base64_image(news_dict["img_url"])
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error saving image: {str(e)}")
+        # Guardar la URL temporal en el dict
+        news_dict["img_url"] = image_url  # ← Actualizar el campo correcto
+    else:
+        news_dict["img_url"] = None  # ← No hay imagen
+
+    # Añadir timestamps
+    now = datetime.utcnow()
+    news_dict["created_at"] = now
+    news_dict["updated_at"] = now
+
+    # Insertar en BD
     result = await news_collection.insert_one(news_dict)
     news_dict["_id"] = str(result.inserted_id)
-    return NewsInDB(**news_dict)  # ← ¡YA ESTÁ CORREGIDO! (porque convertimos _id a str antes)
+
+    # 🔄 OPCIONAL: Renombrar archivo con el _id real (mejor UX)
+    if image_url:
+        old_path = f".{image_url}"  # Ruta física (ej: ./uploads/news/abc123.jpg)
+        extension = Path(old_path).suffix
+        new_filename = f"{news_dict['_id']}{extension}"
+        new_path = f"uploads/news/{new_filename}"
+
+        try:
+            os.rename(old_path, new_path)
+            # Actualizar URL en BD
+            new_image_url = f"/uploads/news/{new_filename}"
+            await news_collection.update_one(
+                {"_id": result.inserted_id},
+                {"$set": {"img_url": new_image_url}}  # ← Actualiza el campo correcto
+            )
+            news_dict["img_url"] = new_image_url
+        except Exception as e:
+            print(f"Error al renombrar imagen: {e}")
+            # Puedes elegir si quieres dejarla con nombre temporal o eliminarla
+
+    return NewsInDB(**news_dict)
 
 @app.get("/news", response_model=List[NewsInDB])
 async def list_news(
@@ -264,6 +327,18 @@ async def verify_token(current_user: dict = Depends(get_current_user)):
         "message": "Token válido"
     }
 
+async def main():
+    # Configura el servidor
+    config = Config(
+        app=app,
+        host="0.0.0.0",
+        port=8000,
+        reload=True,  # Solo en desarrollo
+        limit_concurrency=1000,
+    )
+    server = Server(config)
+    await server.serve()
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import asyncio
+    asyncio.run(main())
