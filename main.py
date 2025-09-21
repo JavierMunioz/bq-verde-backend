@@ -185,9 +185,8 @@ async def create_news(
 
 @app.get("/news", response_model=List[NewsInDB])
 async def list_news(
-    category: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
-):
+    category: Optional[str] = None
+    ):
     query = {}
     if category:
         query["category"] = category
@@ -198,7 +197,7 @@ async def list_news(
     return news_list
 
 @app.get("/news/{news_id}", response_model=NewsInDB)
-async def get_news(news_id: str, current_user: dict = Depends(get_current_user)):
+async def get_news(news_id: str):
     if not ObjectId.is_valid(news_id):
         raise HTTPException(status_code=400, detail="Invalid news ID")
     news = await news_collection.find_one({"_id": ObjectId(news_id)})
@@ -252,14 +251,14 @@ async def create_document(
     return DocumentInDB(**doc_dict)  # ← ¡YA ESTÁ CORREGIDO! (porque convertimos _id a str antes)
 
 @app.get("/documents", response_model=List[DocumentInDB])
-async def list_documents(current_user: dict = Depends(get_current_user)):
+async def list_documents():
     docs = []
     async for d in document_collection.find().sort("name", 1):
         docs.append(DocumentInDB(**{**d, "_id": str(d["_id"])}))  # ← CORREGIDO
     return docs
 
 @app.get("/documents/{doc_id}", response_model=DocumentInDB)
-async def get_document(doc_id: str, current_user: dict = Depends(get_current_user)):
+async def get_document(doc_id: str):
     if not ObjectId.is_valid(doc_id):
         raise HTTPException(status_code=400, detail="Invalid document ID")
     doc = await document_collection.find_one({"_id": ObjectId(doc_id)})
