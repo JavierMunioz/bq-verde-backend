@@ -7,6 +7,7 @@ from bson import ObjectId
 from datetime import datetime, timedelta
 from typing import List, Optional
 import os
+from scripts.create_doc import save_base64_document
 from uvicorn.config import Config
 from uvicorn.server import Server
 from pathlib import Path
@@ -313,9 +314,38 @@ async def create_document(
     current_user: dict = Depends(get_current_user)
 ):
     doc_dict = doc.dict()
+
+    # Validar que sea base64 de documento
+    if not doc_dict.get("document_url", "").startswith(("data:application/", "data:text/")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="document_url must be a base64-encoded string with 'data:application/...' or 'data:text/...' prefix"
+        )
+
+    try:
+        # Guardar archivo y obtener ruta
+        saved_path = save_base64_document(doc_dict["document_url"])
+        doc_dict["document_url"] = saved_path
+
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid document data: {str(ve)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error saving document: {str(e)}"
+        )
+
+    # Añadir created_at si no está (aunque tu modelo lo pone por defecto, es bueno asegurarlo)
+    doc_dict["created_at"] = datetime.utcnow()
+
+    # Insertar en MongoDB
     result = await document_collection.insert_one(doc_dict)
     doc_dict["_id"] = str(result.inserted_id)
-    return DocumentInDB(**doc_dict)  # ← ¡YA ESTÁ CORREGIDO! (porque convertimos _id a str antes)
+
+    return DocumentInDB(**doc_dict)
 
 @app.get("/documents", response_model=List[DocumentInDB])
 async def list_documents():

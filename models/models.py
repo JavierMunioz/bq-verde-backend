@@ -38,6 +38,9 @@ class PyObjectId(str):
 class DocumentBase(BaseModel):
     name: str
     document_url: str
+    description: str
+    autor: str
+    date_disponibility: datetime
 
 
 class DocumentCreate(DocumentBase):
