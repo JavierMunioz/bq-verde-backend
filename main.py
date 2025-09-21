@@ -205,6 +205,8 @@ async def get_news(news_id: str):
         raise HTTPException(status_code=404, detail="News not found")
     return NewsInDB(**{**news, "_id": str(news["_id"])})  # ← CORREGIDO
 
+
+
 @app.put("/news/{news_id}", response_model=NewsInDB)
 async def update_news(
     news_id: str,
@@ -214,26 +216,91 @@ async def update_news(
     if not ObjectId.is_valid(news_id):
         raise HTTPException(status_code=400, detail="Invalid news ID")
 
+    # 📌 Buscar noticia existente
+    existing_news = await news_collection.find_one({"_id": ObjectId(news_id)})
+    if not existing_news:
+        raise HTTPException(status_code=404, detail="News not found")
+
     update_data = {k: v for k, v in news_update.dict(exclude_unset=True).items()}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
+    # 🖼️ Si llega imagen nueva en base64
+    if "img_url" in update_data and update_data["img_url"]:
+        base64_str = update_data["img_url"]
+
+        try:
+            # Guardar la nueva imagen en disco
+            new_image_url = save_base64_image(base64_str)
+            print(new_image_url)  # devuelve ruta relativa
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error saving new image: {str(e)}")
+
+        # Eliminar base64 del diccionario para que no quede en la BD
+        update_data.pop("img_url", None)
+
+        # 🗑️ Borrar imagen anterior si existía
+        old_image_url = existing_news.get("img_url")
+        if old_image_url:
+            old_image_path = f".{old_image_url}"
+            if os.path.exists(old_image_path):
+                try:
+                    os.remove(old_image_path)
+                    print(f"✅ Imagen anterior borrada: {old_image_path}")
+                except Exception as e:
+                    print(f"⚠️ No se pudo borrar la imagen anterior: {e}")
+
+        # 🔄 Renombrar nueva imagen con el ID del documento
+        old_path = f".{new_image_url}"
+        extension = Path(old_path).suffix
+        new_filename = f"{news_id}{extension}"
+        new_path = Path("uploads/news") / new_filename
+
+        try:
+            os.rename(old_path, new_path)
+            final_image_url = f"/uploads/news/{new_filename}"
+        except Exception as e:
+            print(f"⚠️ Error al renombrar la nueva imagen: {e}")
+            final_image_url = new_image_url  # fallback
+
+        # ✅ Guardar SOLO la URL relativa
+        update_data["img_url"] = final_image_url
+
+    # 🕒 Actualizar timestamp
     update_data["updated_at"] = datetime.utcnow()
 
+    # 💾 Aplicar cambios en la BD
     result = await news_collection.update_one(
         {"_id": ObjectId(news_id)},
         {"$set": update_data}
     )
+
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="News not found")
 
+    # 📤 Devolver noticia actualizada
     updated = await news_collection.find_one({"_id": ObjectId(news_id)})
-    return NewsInDB(**{**updated, "_id": str(updated["_id"])})  # ← CORREGIDO
+    return NewsInDB(**{**updated, "_id": str(updated["_id"])})
 
 @app.delete("/news/{news_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_news(news_id: str, current_user: dict = Depends(get_current_user)):
     if not ObjectId.is_valid(news_id):
         raise HTTPException(status_code=400, detail="Invalid news ID")
+    
+    existing_news = await news_collection.find_one({"_id": ObjectId(news_id)})
+    if not existing_news:
+        raise HTTPException(status_code=404, detail="News not found")
+
+    old_image_url = existing_news.get("img_url")
+    if old_image_url:
+        old_image_path = f".{old_image_url}"
+        if os.path.exists(old_image_path):
+            try:
+                os.remove(old_image_path)
+                print(f"✅ Imagen anterior borrada: {old_image_path}")
+            except Exception as e:
+                print(f"⚠️ No se pudo borrar la imagen anterior: {e}")
+
     result = await news_collection.delete_one({"_id": ObjectId(news_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="News not found")
