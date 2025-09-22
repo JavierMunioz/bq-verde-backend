@@ -71,6 +71,7 @@ db = client["bqverde"]
 user_collection = db["users"]
 news_collection = db["news"]
 document_collection = db["documents"]
+station_collection = db["stations"] 
 
 # === FUNCIONES DE AUTENTICACIÓN ===
 
@@ -422,6 +423,78 @@ async def verify_token(current_user: dict = Depends(get_current_user)):
         "is_admin": current_user.get("is_admin", False),
         "message": "Token válido"
     }
+
+# === STATIONS ===
+
+@app.post("/stations", response_model=StationInDB, status_code=status.HTTP_201_CREATED)
+async def create_station(
+    station: StationCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    station_dict = station.dict()
+
+    # Añadir timestamp
+    station_dict["created_at"] = datetime.utcnow()
+
+    # Insertar en MongoDB
+    result = await station_collection.insert_one(station_dict)
+    station_dict["_id"] = str(result.inserted_id)
+
+    return StationInDB(**station_dict)
+
+
+@app.get("/stations", response_model=List[StationInDB])
+async def list_stations():
+    stations = []
+    async for s in station_collection.find().sort("name", 1):
+        stations.append(StationInDB(**{**s, "_id": str(s["_id"])}))
+    return stations
+
+
+@app.get("/stations/{station_id}", response_model=StationInDB)
+async def get_station(station_id: str):
+    if not ObjectId.is_valid(station_id):
+        raise HTTPException(status_code=400, detail="Invalid station ID")
+    station = await station_collection.find_one({"_id": ObjectId(station_id)})
+    if not station:
+        raise HTTPException(status_code=404, detail="Station not found")
+    return StationInDB(**{**station, "_id": str(station["_id"])})
+
+
+@app.put("/stations/{station_id}", response_model=StationInDB)
+async def update_station(
+    station_id: str,
+    station_update: StationUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    if not ObjectId.is_valid(station_id):
+        raise HTTPException(status_code=400, detail="Invalid station ID")
+
+    update_data = {k: v for k, v in station_update.dict(exclude_unset=True).items()}
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Actualizar en BD
+    result = await station_collection.update_one(
+        {"_id": ObjectId(station_id)},
+        {"$set": update_data}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Station not found")
+
+    # Devolver estación actualizada
+    updated = await station_collection.find_one({"_id": ObjectId(station_id)})
+    return StationInDB(**{**updated, "_id": str(updated["_id"])})
+
+
+@app.delete("/stations/{station_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_station(station_id: str, current_user: dict = Depends(get_current_user)):
+    if not ObjectId.is_valid(station_id):
+        raise HTTPException(status_code=400, detail="Invalid station ID")
+    result = await station_collection.delete_one({"_id": ObjectId(station_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Station not found")
 
 async def main():
     # Configura el servidor

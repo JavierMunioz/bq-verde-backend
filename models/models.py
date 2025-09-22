@@ -94,3 +94,35 @@ class NewsInDB(NewsBase):
         "arbitrary_types_allowed": True,
         "json_encoders": {ObjectId: str},
     }
+
+
+# ========================
+# Modelo Station
+# ========================
+class StationBase(BaseModel):
+    name: str
+    lon: int = Field(..., ge=-180, le=180, description="Longitud entre -180 y 180")
+    lat: int = Field(..., ge=-90, le=90, description="Latitud entre -90 y 90")
+    charts_permited: List[str]  # ← Lista de strings (nombres o IDs de gráficos permitidos)
+
+
+class StationCreate(StationBase):
+    pass
+
+
+class StationUpdate(BaseModel):
+    name: Optional[str] = None
+    lon: Optional[int] = None
+    lat: Optional[int] = None
+    charts_permited: Optional[List[str]] = None
+
+
+class StationInDB(StationBase):
+    id: PyObjectId = Field(alias="_id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    model_config = {
+        "populate_by_name": True,
+        "arbitrary_types_allowed": True,
+        "json_encoders": {ObjectId: str},
+    }
