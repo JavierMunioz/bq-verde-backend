@@ -1,33 +1,34 @@
-# main.py — TUS MODELOS ESTÁN BIEN. SOLO CORRIGIENDO ENDPOINTS.
+# main.py
 from scripts.create_img import save_base64_image
+from scripts.create_doc import save_base64_document
 from fastapi import FastAPI, HTTPException, status, Depends, Request
 from fastapi.responses import JSONResponse
-from pymongo.errors import DuplicateKeyError
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import jwt, JWTError
+from models.models import *
+from dotenv import load_dotenv
 from bson import ObjectId
 from datetime import datetime, timedelta
 from typing import List, Optional
+from pathlib import Path
 import os
-from scripts.create_doc import save_base64_document
+import asyncio
 from uvicorn.config import Config
 from uvicorn.server import Server
-from pathlib import Path
-from models.models import *  # Tus modelos están bien
-from dotenv import load_dotenv
-from fastapi.middleware.cors import CORSMiddleware
-from passlib.context import CryptContext
-from jose import jwt, JWTError
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
-# === NUEVO: IMPORT MOTOR (¡ESTO ES LO ÚNICO QUE AÑADES!) ===
-from motor.motor_asyncio import AsyncIOMotorClient
+
 # Cargar variables de entorno
 load_dotenv()
+
 app = FastAPI(title="Sistema de News & Documents")
 
-
+# Middleware para limitar tamaño de subidas (50 MB)
 class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024):  # 50 MB
+    def __init__(self, app, max_upload_size: int = 50 * 1024 * 1024):
         super().__init__(app)
         self.max_upload_size = max_upload_size
 
@@ -40,12 +41,14 @@ class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
             )
         return await call_next(request)
 
-app.add_middleware(LimitUploadSizeMiddleware, max_upload_size=50 * 1024 * 1024)
+app.add_middleware(LimitUploadSizeMiddleware)
 
-
+# Servir archivos estáticos (imágenes y documentos)
 os.makedirs("uploads/news", exist_ok=True)
+os.makedirs("uploads/documents", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-# Configurar CORS
+
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -54,7 +57,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuración JWT
+# Configuración de autenticación
 SECRET_KEY = os.getenv("SECRET_KEY", "una-clave-secreta-muy-larga-y-segura-1234567890")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
@@ -62,18 +65,18 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# === CONEXIÓN A MONGODB (CAMBIADO A MOTOR ASÍNCRONO) ===
+# Conexión a MongoDB
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["bqverde"]
 
-# Colecciones (¡SOLO LAS QUE USAMOS!)
+# Colecciones
 user_collection = db["users"]
 news_collection = db["news"]
 document_collection = db["documents"]
-station_collection = db["stations"] 
+station_collection = db["stations"]
 
-# === FUNCIONES DE AUTENTICACIÓN ===
+# === UTILIDADES DE AUTENTICACIÓN ===
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -83,13 +86,11 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, expires_delta: timedelta = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expire = datetime.utcnow() + (
+        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -109,93 +110,73 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return user
 
-# === ENDPOINTS ===
+# === ENDPOINTS DE AUTENTICACIÓN ===
 
 @app.post("/login", response_model=dict)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = await user_collection.find_one({"email": form_data.username})
-    if not user:
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Credenciales incorrectas",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if not verify_password(form_data.password, user["hashed_password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales incorrectas",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
+        data={"sub": user["username"]},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# === NEWS ===
-
+# === ENDPOINTS DE NOTICIAS ===
 
 @app.post("/news", response_model=NewsInDB, status_code=status.HTTP_201_CREATED)
-async def create_news(
-    news: NewsCreate,
-    current_user: dict = Depends(get_current_user)
-):
+async def create_news(news: NewsCreate, current_user: dict = Depends(get_current_user)):
     news_dict = news.dict()
 
-    # Si viene imagen en base64 (en img_url), guardarla
-    image_url = None
-    if news_dict.get("img_url"):  # ← ¡Aquí! Usar el nombre correcto
+    # Procesar imagen si se envía en base64
+    if news_dict.get("img_url"):
         try:
             image_url = save_base64_image(news_dict["img_url"])
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error saving image: {str(e)}")
-        # Guardar la URL temporal en el dict
-        news_dict["img_url"] = image_url  # ← Actualizar el campo correcto
+        news_dict["img_url"] = image_url
     else:
-        news_dict["img_url"] = None  # ← No hay imagen
+        news_dict["img_url"] = None
 
-    # Añadir timestamps
     now = datetime.utcnow()
     news_dict["created_at"] = now
     news_dict["updated_at"] = now
 
-    # Insertar en BD
     result = await news_collection.insert_one(news_dict)
     news_dict["_id"] = str(result.inserted_id)
 
-    # 🔄 OPCIONAL: Renombrar archivo con el _id real (mejor UX)
-    if image_url:
-        old_path = f".{image_url}"  # Ruta física (ej: ./uploads/news/abc123.jpg)
+    # Renombrar imagen con el ID del documento (mejor gestión de archivos)
+    if news_dict["img_url"]:
+        old_path = f".{news_dict['img_url']}"
         extension = Path(old_path).suffix
         new_filename = f"{news_dict['_id']}{extension}"
-        new_path = f"uploads/news/{new_filename}"
+        new_path = Path("uploads/news") / new_filename
 
         try:
             os.rename(old_path, new_path)
-            # Actualizar URL en BD
-            new_image_url = f"/uploads/news/{new_filename}"
+            final_url = f"/uploads/news/{new_filename}"
             await news_collection.update_one(
                 {"_id": result.inserted_id},
-                {"$set": {"img_url": new_image_url}}  # ← Actualiza el campo correcto
+                {"$set": {"img_url": final_url}}
             )
-            news_dict["img_url"] = new_image_url
+            news_dict["img_url"] = final_url
         except Exception as e:
-            print(f"Error al renombrar imagen: {e}")
-            # Puedes elegir si quieres dejarla con nombre temporal o eliminarla
+            print(f"Advertencia: no se pudo renombrar la imagen: {e}")
 
     return NewsInDB(**news_dict)
 
 @app.get("/news", response_model=List[NewsInDB])
-async def list_news(
-    category: Optional[str] = None
-    ):
-    query = {}
-    if category:
-        query["category"] = category
-
+async def list_news(category: Optional[str] = None):
+    query = {"category": category} if category else {}
     news_list = []
     async for n in news_collection.find(query).sort("created_at", -1):
-        news_list.append(NewsInDB(**{**n, "_id": str(n["_id"])}))  # ← CORREGIDO
+        n["_id"] = str(n["_id"])
+        news_list.append(NewsInDB(**n))
     return news_list
 
 @app.get("/news/{news_id}", response_model=NewsInDB)
@@ -205,9 +186,8 @@ async def get_news(news_id: str):
     news = await news_collection.find_one({"_id": ObjectId(news_id)})
     if not news:
         raise HTTPException(status_code=404, detail="News not found")
-    return NewsInDB(**{**news, "_id": str(news["_id"])})  # ← CORREGIDO
-
-
+    news["_id"] = str(news["_id"])
+    return NewsInDB(**news)
 
 @app.put("/news/{news_id}", response_model=NewsInDB)
 async def update_news(
@@ -218,141 +198,86 @@ async def update_news(
     if not ObjectId.is_valid(news_id):
         raise HTTPException(status_code=400, detail="Invalid news ID")
 
-    # 📌 Buscar noticia existente
-    existing_news = await news_collection.find_one({"_id": ObjectId(news_id)})
-    if not existing_news:
+    existing = await news_collection.find_one({"_id": ObjectId(news_id)})
+    if not existing:
         raise HTTPException(status_code=404, detail="News not found")
 
-    update_data = {k: v for k, v in news_update.dict(exclude_unset=True).items()}
+    update_data = {k: v for k, v in news_update.dict(exclude_unset=True).items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # 🖼️ Si llega imagen nueva en base64
+    # Manejo de nueva imagen
     if "img_url" in update_data and update_data["img_url"]:
         base64_str = update_data["img_url"]
-
         try:
-            # Guardar la nueva imagen en disco
             new_image_url = save_base64_image(base64_str)
-            print(new_image_url)  # devuelve ruta relativa
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error saving new image: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Error saving image: {str(e)}")
 
-        # Eliminar base64 del diccionario para que no quede en la BD
-        update_data.pop("img_url", None)
+        # Eliminar imagen anterior
+        old_url = existing.get("img_url")
+        if old_url and os.path.exists(f".{old_url}"):
+            os.remove(f".{old_url}")
 
-        # 🗑️ Borrar imagen anterior si existía
-        old_image_url = existing_news.get("img_url")
-        if old_image_url:
-            old_image_path = f".{old_image_url}"
-            if os.path.exists(old_image_path):
-                try:
-                    os.remove(old_image_path)
-                    print(f"✅ Imagen anterior borrada: {old_image_path}")
-                except Exception as e:
-                    print(f"⚠️ No se pudo borrar la imagen anterior: {e}")
-
-        # 🔄 Renombrar nueva imagen con el ID del documento
+        # Renombrar nueva imagen con ID del documento
         old_path = f".{new_image_url}"
-        extension = Path(old_path).suffix
-        new_filename = f"{news_id}{extension}"
+        ext = Path(old_path).suffix
+        new_filename = f"{news_id}{ext}"
         new_path = Path("uploads/news") / new_filename
-
         try:
             os.rename(old_path, new_path)
-            final_image_url = f"/uploads/news/{new_filename}"
+            update_data["img_url"] = f"/uploads/news/{new_filename}"
         except Exception as e:
-            print(f"⚠️ Error al renombrar la nueva imagen: {e}")
-            final_image_url = new_image_url  # fallback
+            update_data["img_url"] = new_image_url  # fallback
 
-        # ✅ Guardar SOLO la URL relativa
-        update_data["img_url"] = final_image_url
-
-    # 🕒 Actualizar timestamp
     update_data["updated_at"] = datetime.utcnow()
 
-    # 💾 Aplicar cambios en la BD
-    result = await news_collection.update_one(
-        {"_id": ObjectId(news_id)},
-        {"$set": update_data}
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="News not found")
-
-    # 📤 Devolver noticia actualizada
+    await news_collection.update_one({"_id": ObjectId(news_id)}, {"$set": update_data})
     updated = await news_collection.find_one({"_id": ObjectId(news_id)})
-    return NewsInDB(**{**updated, "_id": str(updated["_id"])})
+    updated["_id"] = str(updated["_id"])
+    return NewsInDB(**updated)
 
 @app.delete("/news/{news_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_news(news_id: str, current_user: dict = Depends(get_current_user)):
     if not ObjectId.is_valid(news_id):
         raise HTTPException(status_code=400, detail="Invalid news ID")
-    
-    existing_news = await news_collection.find_one({"_id": ObjectId(news_id)})
-    if not existing_news:
+    news = await news_collection.find_one({"_id": ObjectId(news_id)})
+    if not news:
         raise HTTPException(status_code=404, detail="News not found")
 
-    old_image_url = existing_news.get("img_url")
-    if old_image_url:
-        old_image_path = f".{old_image_url}"
-        if os.path.exists(old_image_path):
-            try:
-                os.remove(old_image_path)
-                print(f"✅ Imagen anterior borrada: {old_image_path}")
-            except Exception as e:
-                print(f"⚠️ No se pudo borrar la imagen anterior: {e}")
+    if news.get("img_url") and os.path.exists(f".{news['img_url']}"):
+        os.remove(f".{news['img_url']}")
 
-    result = await news_collection.delete_one({"_id": ObjectId(news_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="News not found")
+    await news_collection.delete_one({"_id": ObjectId(news_id)})
 
-# === DOCUMENTS ===
+# === ENDPOINTS DE DOCUMENTOS ===
 
 @app.post("/documents", response_model=DocumentInDB, status_code=status.HTTP_201_CREATED)
-async def create_document(
-    doc: DocumentCreate,
-    current_user: dict = Depends(get_current_user)
-):
+async def create_document(doc: DocumentCreate, current_user: dict = Depends(get_current_user)):
     doc_dict = doc.dict()
 
-    # Validar que sea base64 de documento
     if not doc_dict.get("document_url", "").startswith(("data:application/", "data:text/")):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="document_url must be a base64-encoded string with 'data:application/...' or 'data:text/...' prefix"
+            status_code=400,
+            detail="document_url must be a base64 string with 'data:application/...' or 'data:text/...' prefix"
         )
 
     try:
-        # Guardar archivo y obtener ruta
-        saved_path = save_base64_document(doc_dict["document_url"])
-        doc_dict["document_url"] = saved_path
-
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid document data: {str(ve)}"
-        )
+        doc_dict["document_url"] = save_base64_document(doc_dict["document_url"])
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error saving document: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid document: {str(e)}")
 
-    # Añadir created_at si no está (aunque tu modelo lo pone por defecto, es bueno asegurarlo)
     doc_dict["created_at"] = datetime.utcnow()
-
-    # Insertar en MongoDB
     result = await document_collection.insert_one(doc_dict)
     doc_dict["_id"] = str(result.inserted_id)
-
     return DocumentInDB(**doc_dict)
 
 @app.get("/documents", response_model=List[DocumentInDB])
 async def list_documents():
     docs = []
     async for d in document_collection.find().sort("name", 1):
-        docs.append(DocumentInDB(**{**d, "_id": str(d["_id"])}))  # ← CORREGIDO
+        d["_id"] = str(d["_id"])
+        docs.append(DocumentInDB(**d))
     return docs
 
 @app.get("/documents/{doc_id}", response_model=DocumentInDB)
@@ -362,7 +287,8 @@ async def get_document(doc_id: str):
     doc = await document_collection.find_one({"_id": ObjectId(doc_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    return DocumentInDB(**{**doc, "_id": str(doc["_id"])})  # ← CORREGIDO
+    doc["_id"] = str(doc["_id"])
+    return DocumentInDB(**doc)
 
 @app.put("/documents/{doc_id}", response_model=DocumentInDB)
 async def update_document(
@@ -373,83 +299,41 @@ async def update_document(
     if not ObjectId.is_valid(doc_id):
         raise HTTPException(status_code=400, detail="Invalid document ID")
 
-    update_data = {k: v for k, v in doc_update.dict(exclude_unset=True).items()}
+    update_data = {k: v for k, v in doc_update.dict(exclude_unset=True).items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    result = await document_collection.update_one(
-        {"_id": ObjectId(doc_id)},
-        {"$set": update_data}
-    )
+    result = await document_collection.update_one({"_id": ObjectId(doc_id)}, {"$set": update_data})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Document not found")
 
     updated = await document_collection.find_one({"_id": ObjectId(doc_id)})
-    return DocumentInDB(**{**updated, "_id": str(updated["_id"])})  # ← CORREGIDO
+    updated["_id"] = str(updated["_id"])
+    return DocumentInDB(**updated)
 
 @app.delete("/documents/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(doc_id: str, current_user: dict = Depends(get_current_user)):
     if not ObjectId.is_valid(doc_id):
         raise HTTPException(status_code=400, detail="Invalid document ID")
-    result = await document_collection.delete_one({"_id": ObjectId(doc_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Document not found")
+    await document_collection.delete_one({"_id": ObjectId(doc_id)})
 
-# === EJEMPLO DE USUARIO INICIAL (opcional, para pruebas) ===
-
-@app.post("/init-admin", include_in_schema=False)
-async def init_admin():
-    user = await user_collection.find_one({"username": "admin"})
-    if not user:
-        hashed_pw = get_password_hash("admin123")
-        await user_collection.insert_one({
-            "username": "admin",
-            "email": "admin@example.com",
-            "hashed_password": hashed_pw,
-            "is_admin": True
-        })
-        return {"message": "Admin user created with email=admin@example.com, password=admin123"}
-    return {"message": "Admin user already exists"}
-
-@app.post("/verify", response_model=dict)
-async def verify_token(current_user: dict = Depends(get_current_user)):
-    """
-    Verifica que el JWT sea válido y devuelve los datos básicos del usuario.
-    Se usa desde el middleware de Astro para proteger rutas SSR.
-    """
-    return {
-        "username": current_user["username"],
-        "email": current_user["email"],
-        "is_admin": current_user.get("is_admin", False),
-        "message": "Token válido"
-    }
-
-# === STATIONS ===
+# === ENDPOINTS DE ESTACIONES ===
 
 @app.post("/stations", response_model=StationInDB, status_code=status.HTTP_201_CREATED)
-async def create_station(
-    station: StationCreate,
-    current_user: dict = Depends(get_current_user)
-):
+async def create_station(station: StationCreate, current_user: dict = Depends(get_current_user)):
     station_dict = station.dict()
-
-    # Añadir timestamp
     station_dict["created_at"] = datetime.utcnow()
-
-    # Insertar en MongoDB
     result = await station_collection.insert_one(station_dict)
     station_dict["_id"] = str(result.inserted_id)
-
     return StationInDB(**station_dict)
-
 
 @app.get("/stations", response_model=List[StationInDB])
 async def list_stations():
     stations = []
     async for s in station_collection.find().sort("name", 1):
-        stations.append(StationInDB(**{**s, "_id": str(s["_id"])}))
+        s["_id"] = str(s["_id"])
+        stations.append(StationInDB(**s))
     return stations
-
 
 @app.get("/stations/{station_id}", response_model=StationInDB)
 async def get_station(station_id: str):
@@ -458,8 +342,8 @@ async def get_station(station_id: str):
     station = await station_collection.find_one({"_id": ObjectId(station_id)})
     if not station:
         raise HTTPException(status_code=404, detail="Station not found")
-    return StationInDB(**{**station, "_id": str(station["_id"])})
-
+    station["_id"] = str(station["_id"])
+    return StationInDB(**station)
 
 @app.put("/stations/{station_id}", response_model=StationInDB)
 async def update_station(
@@ -470,44 +354,56 @@ async def update_station(
     if not ObjectId.is_valid(station_id):
         raise HTTPException(status_code=400, detail="Invalid station ID")
 
-    update_data = {k: v for k, v in station_update.dict(exclude_unset=True).items()}
+    update_data = {k: v for k, v in station_update.dict(exclude_unset=True).items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Actualizar en BD
-    result = await station_collection.update_one(
-        {"_id": ObjectId(station_id)},
-        {"$set": update_data}
-    )
-
+    result = await station_collection.update_one({"_id": ObjectId(station_id)}, {"$set": update_data})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Station not found")
 
-    # Devolver estación actualizada
     updated = await station_collection.find_one({"_id": ObjectId(station_id)})
-    return StationInDB(**{**updated, "_id": str(updated["_id"])})
-
+    updated["_id"] = str(updated["_id"])
+    return StationInDB(**updated)
 
 @app.delete("/stations/{station_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_station(station_id: str, current_user: dict = Depends(get_current_user)):
     if not ObjectId.is_valid(station_id):
         raise HTTPException(status_code=400, detail="Invalid station ID")
-    result = await station_collection.delete_one({"_id": ObjectId(station_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Station not found")
+    await station_collection.delete_one({"_id": ObjectId(station_id)})
+
+# === ENDPOINTS AUXILIARES ===
+
+@app.post("/init-admin", include_in_schema=False)
+async def init_admin():
+    """Crea un usuario administrador para desarrollo."""
+    if await user_collection.find_one({"username": "admin"}):
+        return {"message": "Admin user already exists"}
+    hashed_pw = get_password_hash("admin123")
+    await user_collection.insert_one({
+        "username": "admin",
+        "email": "admin@example.com",
+        "hashed_password": hashed_pw,
+        "is_admin": True
+    })
+    return {"message": "Admin created (email: admin@example.com, password: admin123)"}
+
+@app.post("/verify", response_model=dict)
+async def verify_token(current_user: dict = Depends(get_current_user)):
+    """Verifica la validez del token JWT (útil para integración con frontend SSR)."""
+    return {
+        "username": current_user["username"],
+        "email": current_user["email"],
+        "is_admin": current_user.get("is_admin", False),
+        "message": "Token válido"
+    }
+
+# === EJECUCIÓN ===
 
 async def main():
-    # Configura el servidor
-    config = Config(
-        app=app,
-        host="0.0.0.0",
-        port=8000,
-        reload=True,  # Solo en desarrollo
-        limit_concurrency=1000,
-    )
+    config = Config(app=app, host="0.0.0.0", port=8000, reload=True)
     server = Server(config)
     await server.serve()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
